@@ -47,7 +47,7 @@ RUN composer dump-autoload --optimize --no-dev
 
 
 # ---------- Stage 3: runtime (PHP-FPM + Nginx + Reverb) ----------
-FROM php:8.3-fpm-alpine AS runtime
+FROM php:8.4-fpm-alpine AS runtime
 
 # Herramienta que resuelve automaticamente las dependencias de cada extension PHP
 COPY --from=mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/local/bin/
