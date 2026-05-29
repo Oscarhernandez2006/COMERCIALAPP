@@ -1,0 +1,28 @@
+# Build artifacts y dependencias (se regeneran en la imagen)
+**/node_modules
+**/vendor
+frontend/dist
+
+# Entornos locales (las env van por Dokploy)
+**/.env
+**/.env.*
+!**/.env.example
+
+# Git / VCS
+.git
+.gitignore
+.gitattributes
+
+# Caches de Laravel
+backend/storage/logs/*
+backend/storage/framework/cache/*
+backend/storage/framework/sessions/*
+backend/storage/framework/views/*
+backend/bootstrap/cache/*
+
+# Varios
+**/*.log
+smoke*.ps1
+smoke*.txt
+README.md
+**/.DS_Store
