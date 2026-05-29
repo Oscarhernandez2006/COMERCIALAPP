@@ -9,7 +9,9 @@ chown -R www-data:www-data storage bootstrap/cache || true
 
 # Generar APP_KEY si no viene definida en el entorno
 if [ -z "$APP_KEY" ]; then
-    echo "[entrypoint] APP_KEY vacia -> generando una temporal"
+    echo "[entrypoint] APP_KEY vacia -> generando una temporal (configurala en Dokploy para que sea estable)"
+    # key:generate necesita un archivo .env donde escribir
+    [ -f .env ] || touch .env
     php artisan key:generate --force || true
 fi
 
