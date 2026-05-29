@@ -18,7 +18,7 @@ class NewChatMessage implements ShouldBroadcastNow
     public string $sessionId;
     public array $payload;
 
-    public function __construct(ChatMessage $message, string $sessionId)
+    public function __construct(ChatMessage $message, string $sessionId, ?string $conversationStatus = null)
     {
         $this->conversationId = (int) $message->conversation_id;
         $this->sessionId = $sessionId;
@@ -33,6 +33,7 @@ class NewChatMessage implements ShouldBroadcastNow
             'attachment_mime' => $message->attachment_mime,
             'attachment_size' => $message->attachment_size,
             'metadata' => $message->metadata,
+            'conversation_status' => $conversationStatus,
             'created_at' => optional($message->created_at)->toIso8601String(),
         ];
     }
@@ -67,10 +68,10 @@ class NewChatMessage implements ShouldBroadcastNow
      * solo registramos el warning y seguimos. El cliente recibirá el mensaje vía
      * el polling de fallback igualmente.
      */
-    public static function dispatchSafe(ChatMessage $message, string $sessionId): void
+    public static function dispatchSafe(ChatMessage $message, string $sessionId, ?string $conversationStatus = null): void
     {
         try {
-            self::dispatch($message, $sessionId);
+            self::dispatch($message, $sessionId, $conversationStatus);
         } catch (\Throwable $e) {
             Log::warning('[broadcast] No se pudo emitir NewChatMessage: '.$e->getMessage(), [
                 'conversation_id' => $message->conversation_id,

@@ -51,7 +51,7 @@ class ChatController extends Controller
         }
 
         // Si la conversación está tomada por un humano, el bot NO responde.
-        // El mensaje del cliente se guarda y llegará al vendedor por polling.
+        // El mensaje del cliente ya se emitió por WebSocket (logMessage) y llega al vendedor al instante.
         if (in_array($conversation->status, ['human', 'closed'], true)) {
             Cache::put($cacheKey, $state, now()->addHours(2));
             $closed = $conversation->status === 'closed';
@@ -110,10 +110,33 @@ class ChatController extends Controller
 
     private function ensureConversation(string $sessionId): ChatConversation
     {
-        return ChatConversation::firstOrCreate(
+        // Cacheamos la conversación por session_id para evitar un SELECT (~280ms a la BD
+        // remota) en cada mensaje. El caché se invalida (Cache::forget) en cada punto donde
+        // cambia el status (take/close/reply/upload del admin y finalizeLead aquí), de modo
+        // que nunca usamos un status obsoleto que haría responder al bot por error.
+        $key = self::convCacheKey($sessionId);
+        $cached = Cache::get($key);
+        if ($cached instanceof ChatConversation) {
+            return $cached;
+        }
+
+        $conv = ChatConversation::firstOrCreate(
             ['session_id' => $sessionId],
             ['status' => 'bot', 'started_at' => now(), 'last_message_at' => now()],
         );
+        Cache::put($key, $conv, now()->addHours(2));
+
+        return $conv;
+    }
+
+    public static function convCacheKey(string $sessionId): string
+    {
+        return "chat:conv:{$sessionId}";
+    }
+
+    private function forgetConversationCache(string $sessionId): void
+    {
+        Cache::forget(self::convCacheKey($sessionId));
     }
 
     /**
@@ -165,11 +188,26 @@ class ChatController extends Controller
             'metadata' => $meta,
             'created_at' => now(),
         ]);
-        $conv->update(['last_message_at' => now()]);
 
-        // Solo emitimos al canal los mensajes del bot/system/seller (que el cliente NO originó) o los del cliente
-        // para que el vendedor se entere en tiempo real.
+        // El broadcast es lo que entrega el mensaje en vivo al otro lado (~80ms). Lo hacemos
+        // ANTES de cualquier escritura adicional para que el receptor lo vea cuanto antes.
         NewChatMessage::dispatchSafe($msg, $conv->session_id);
+
+        // El UPDATE de last_message_at (otra query ~280ms a la BD remota) solo sirve para
+        // ordenar la bandeja del admin. Lo throttleamos a máximo 1 vez cada 8s por conversación
+        // para no pagar esa query en cada mensaje.
+        $convId = $conv->id;
+        $touchKey = "chat:touched:{$convId}";
+        if (! Cache::get($touchKey)) {
+            Cache::put($touchKey, true, now()->addSeconds(8));
+            app()->terminating(function () use ($convId) {
+                try {
+                    ChatConversation::whereKey($convId)->update(['last_message_at' => now()]);
+                } catch (\Throwable $e) {
+                    // best-effort: el orden de la bandeja puede esperar
+                }
+            });
+        }
     }
 
     private function processTurn(array &$state, string $message, ChatConversation $conv): array
@@ -398,7 +436,9 @@ class ChatController extends Controller
         if (empty($state['lead']['phone'])) {
             if (preg_match('/(?:tel[eé]fono|cel(?:ular)?|whats?app|wpp|n[uú]mero|m[oó]vil)\s*(?:es|:|son)?\s*([+\d][\d\s().-]{6,})/iu', $msg, $pm)) {
                 $state['lead']['phone'] = trim($pm[1]);
-            } else {
+            } elseif (! empty($state['document_number'])) {
+                // Solo aceptamos un número "suelto" como teléfono cuando ya tenemos el documento,
+                // para no confundir la cédula/NIT con el celular.
                 $digitsOnly = preg_replace('/\D/', '', $msg);
                 if (mb_strlen($digitsOnly) >= 7 && mb_strlen($digitsOnly) <= 15 && preg_match('/^[+\d][\d\s().-]{6,}$/u', $msg)) {
                     $state['lead']['phone'] = trim($msg);
@@ -421,7 +461,10 @@ class ChatController extends Controller
             }
             if ($name) {
                 $clean = trim(preg_replace('/\s+/u', ' ', $name));
-                if (mb_strlen($clean) >= 2 && mb_strlen($clean) <= 80) {
+                // Un nombre/razón social debe contener letras; nunca aceptamos un número puro
+                // (eso sería la cédula o el NIT, no el nombre de la persona).
+                $hasLetters = preg_match('/\p{L}{2,}/u', $clean) === 1;
+                if ($hasLetters && mb_strlen($clean) >= 2 && mb_strlen($clean) <= 80) {
                     $state['lead']['name'] = $this->smartTitleCase($clean);
                 }
             }
@@ -659,6 +702,7 @@ class ChatController extends Controller
         ]);
 
         $this->mergeIfDuplicateClientConversation($conv, $client->id);
+        $this->forgetConversationCache($conv->session_id);
     }
 
     private function finalizeLead(string $sessionId, array $state, ChatConversation $conv): void
@@ -683,6 +727,7 @@ class ChatController extends Controller
         );
 
         $conv->update(['status' => 'waiting_human']);
+        $this->forgetConversationCache($conv->session_id);
     }
 
     /**

@@ -10,6 +10,11 @@ const port = Number(import.meta.env.VITE_REVERB_PORT ?? 8080)
 const scheme = (import.meta.env.VITE_REVERB_SCHEME as string | undefined) ?? 'http'
 
 let echo: Echo<'reverb'> | null = null
+let connected = false
+
+export function isEchoConnected(): boolean {
+  return connected
+}
 
 export function getEcho(): Echo<'reverb'> | null {
   if (!key) return null
@@ -26,8 +31,20 @@ export function getEcho(): Echo<'reverb'> | null {
       disableStats: true,
     })
     const pusher = (echo as unknown as { connector: { pusher: Pusher } }).connector.pusher
-    pusher.connection.bind('connected', () => console.info('[echo] conectado a Reverb', host, port))
-    pusher.connection.bind('disconnected', () => console.warn('[echo] desconectado de Reverb'))
+    pusher.connection.bind('connected', () => {
+      connected = true
+      console.info('[echo] conectado a Reverb', host, port)
+    })
+    pusher.connection.bind('disconnected', () => {
+      connected = false
+      console.warn('[echo] desconectado de Reverb')
+    })
+    pusher.connection.bind('unavailable', () => {
+      connected = false
+    })
+    pusher.connection.bind('failed', () => {
+      connected = false
+    })
     pusher.connection.bind('error', (err: unknown) => console.warn('[echo] error', err))
     return echo
   } catch (err) {

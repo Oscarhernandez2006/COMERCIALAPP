@@ -5,7 +5,7 @@ import { toast } from 'sonner';
 import { PageTitle } from '@/components/admin/AdminLayout';
 import { Button } from '@/components/ui/button';
 import { adminApi, apiErrorMessage } from '@/lib/admin-api';
-import { getEcho } from '@/lib/echo';
+import { getEcho, isEchoConnected } from '@/lib/echo';
 import { cn } from '@/lib/utils';
 import { VoiceRecorder } from '@/components/chat/VoiceRecorder';
 
@@ -86,7 +86,7 @@ function formatChatTime(iso?: string | null): string {
 }
 
 export default function AdminChats() {
-  const [statusFilter, setStatusFilter] = useState<ConversationStatus | 'all'>('all');
+  const [statusFilter, setStatusFilter] = useState<ConversationStatus | 'all' | 'priority'>('priority');
   const [search, setSearch] = useState('');
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const prevUnreadRef = useRef<number>(0);
@@ -113,13 +113,13 @@ export default function AdminChats() {
     queryFn: async () => {
       const { data } = await adminApi.get<{ data: ConversationListItem[] }>('/admin/chats', {
         params: {
-          status: statusFilter === 'all' ? undefined : statusFilter,
+          status: statusFilter === 'all' ? 'all' : statusFilter,
           q: search || undefined,
         },
       });
       return data.data;
     },
-    refetchInterval: 4000,
+    refetchInterval: () => (isEchoConnected() ? 15000 : 4000),
     refetchOnWindowFocus: true,
   });
 
@@ -175,7 +175,7 @@ export default function AdminChats() {
 
           {/* Filtros */}
           <div className="flex flex-wrap gap-1 border-b border-neutral-100 px-3 pb-2">
-            {(['all', 'waiting_human', 'human', 'bot', 'closed'] as const).map((s) => (
+            {(['priority', 'waiting_human', 'human', 'bot', 'closed', 'all'] as const).map((s) => (
               <button
                 key={s}
                 onClick={() => setStatusFilter(s)}
@@ -186,7 +186,7 @@ export default function AdminChats() {
                     : 'bg-[#f0f2f5] text-neutral-600 hover:bg-neutral-200',
                 )}
               >
-                {s === 'all' ? 'Todas' : statusStyles[s].label}
+                {s === 'all' ? 'Todas' : s === 'priority' ? 'Prioritarias' : statusStyles[s].label}
               </button>
             ))}
           </div>
@@ -340,7 +340,7 @@ function ChatWindow({ conversationId, onClose }: { conversationId: number; onClo
   const detailQuery = useQuery({
     queryKey: ['admin', 'chats', conversationId],
     queryFn: async () => (await adminApi.get<ChatDetail>(`/admin/chats/${conversationId}`)).data,
-    refetchInterval: 8000, // fallback; el websocket inyecta en vivo
+    refetchInterval: () => (isEchoConnected() ? 12000 : 3000), // fallback; el websocket inyecta en vivo
     refetchOnWindowFocus: true,
   });
 
@@ -435,19 +435,9 @@ function ChatWindow({ conversationId, onClose }: { conversationId: number; onClo
 
   const takeMut = useMutation({
     mutationFn: async () => (await adminApi.post(`/admin/chats/${conversationId}/take`)).data,
-    onMutate: async () => {
-      await qc.cancelQueries({ queryKey: ['admin', 'chats', conversationId] });
-      const prev = qc.getQueryData<ChatDetail>(['admin', 'chats', conversationId]);
-      if (prev) {
-        qc.setQueryData<ChatDetail>(['admin', 'chats', conversationId], {
-          ...prev,
-          conversation: { ...prev.conversation, status: 'human' },
-        });
-      }
-      return { prev };
-    },
-    onError: (e, _v, ctx) => {
-      if (ctx?.prev) qc.setQueryData(['admin', 'chats', conversationId], ctx.prev);
+    // No actualizamos el status de forma optimista: así el botón muestra el estado
+    // "Iniciando…" hasta que el servidor confirme realmente la incorporación.
+    onError: (e) => {
       toast.error(apiErrorMessage(e));
     },
     onSuccess: () => toast.success('Conversación iniciada'),
@@ -489,11 +479,45 @@ function ChatWindow({ conversationId, onClose }: { conversationId: number; onClo
         headers: { 'Content-Type': 'multipart/form-data' },
       })).data;
     },
+    // Preview local inmediato del adjunto del vendedor (como WhatsApp).
+    onMutate: async (file: File) => {
+      await qc.cancelQueries({ queryKey: ['admin', 'chats', conversationId] });
+      const prev = qc.getQueryData<ChatDetail>(['admin', 'chats', conversationId]);
+      const tempId = -Date.now();
+      const isAudio = file.type.startsWith('audio/') || /\.(webm|ogg|oga|mp3|m4a|aac|wav|opus|weba)$/i.test(file.name);
+      const isImage = file.type.startsWith('image/');
+      const localType = isAudio ? 'audio' : isImage ? 'image' : 'file';
+      if (prev) {
+        qc.setQueryData<ChatDetail>(['admin', 'chats', conversationId], {
+          ...prev,
+          messages: [
+            ...prev.messages,
+            {
+              id: tempId,
+              sender: 'seller',
+              sender_id: null,
+              type: localType,
+              body: '',
+              attachment_url: URL.createObjectURL(file),
+              attachment_name: file.name,
+              attachment_mime: file.type || (isAudio ? 'audio/webm' : 'application/octet-stream'),
+              attachment_size: file.size,
+              metadata: null,
+              created_at: new Date().toISOString(),
+            } as MessageRow,
+          ],
+        });
+      }
+      return { prev };
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['admin', 'chats', conversationId] });
       qc.invalidateQueries({ queryKey: ['admin', 'chats'] });
     },
-    onError: (e) => toast.error(apiErrorMessage(e)),
+    onError: (e, _file, ctx) => {
+      if (ctx?.prev) qc.setQueryData(['admin', 'chats', conversationId], ctx.prev);
+      toast.error(apiErrorMessage(e));
+    },
   });
 
   const onPickFile = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -535,7 +559,10 @@ function ChatWindow({ conversationId, onClose }: { conversationId: number; onClo
   }
 
   const conv = detailQuery.data.conversation;
-  const messages = detailQuery.data.messages;
+  // Deduplicar por id para evitar mensajes repetidos (carrera entre WebSocket y refetch).
+  const messages = Array.from(
+    new Map(detailQuery.data.messages.map((m) => [m.id, m])).values(),
+  );
   const closed = conv.status === 'closed';
 
   return (
@@ -624,7 +651,7 @@ function ChatWindow({ conversationId, onClose }: { conversationId: number; onClo
         {messages.map((m, idx) => {
           const prev = messages[idx - 1];
           const showAvatar = !prev || prev.sender !== m.sender;
-          return <MessageBubble key={m.id} m={m} showTail={showAvatar} />;
+          return <MessageBubble key={`${m.id}-${idx}`} m={m} showTail={showAvatar} />;
         })}
         {messages.length === 0 && (
           <div className="flex h-full items-center justify-center">
@@ -672,14 +699,14 @@ function ChatWindow({ conversationId, onClose }: { conversationId: number; onClo
               setBody(e.target.value);
               if (!closed && e.target.value.trim()) notifyTyping();
             }}
-            disabled={closed || replyMut.isPending}
+            disabled={closed}
             className="w-full bg-transparent text-sm outline-none placeholder:text-neutral-500"
             autoComplete="off"
           />
         </div>
         <button
           type="submit"
-          disabled={closed || replyMut.isPending || !body.trim()}
+          disabled={closed || !body.trim()}
           className="grid size-10 place-items-center rounded-full bg-[#00a884] text-white transition hover:bg-[#06cf9c] disabled:bg-neutral-300"
           title="Enviar"
         >

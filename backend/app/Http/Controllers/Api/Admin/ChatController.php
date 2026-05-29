@@ -38,7 +38,12 @@ class ChatController extends Controller
             })
             ->orderByDesc('last_message_at');
 
-        if ($status) {
+        // Por defecto (o status=priority) la bandeja muestra solo lo que requiere atención:
+        // conversaciones en espera (waiting_human) y activas con un asesor (human).
+        // status=all muestra todas; cualquier otro valor filtra por ese estado puntual.
+        if ($status === null || $status === '' || $status === 'priority') {
+            $query->whereIn('status', ['waiting_human', 'human']);
+        } elseif ($status !== 'all') {
             $query->where('status', $status);
         }
         if ($sellerId) {
@@ -114,16 +119,31 @@ class ChatController extends Controller
             'created_at' => now(),
         ]);
 
-        // Si está en bot/waiting, lo pasamos a human
-        if (in_array($chat->status, ['bot', 'waiting_human'], true)) {
-            $chat->status = 'human';
-        }
-        $chat->last_message_at = now();
-        $chat->save();
+        // Estado resultante (sin tocar la BD todavía).
+        $newStatus = in_array($chat->status, ['bot', 'waiting_human'], true) ? 'human' : $chat->status;
+        $chat->status = $newStatus;
 
-        NewChatMessage::dispatchSafe($msg, $chat->session_id);
+        // Mantener coherente el caché de conversación que usa el endpoint público:
+        // así el bot deja de responder al instante, aunque el UPDATE a la BD se difiera.
+        Cache::put("chat:conv:{$chat->session_id}", $chat, now()->addHours(2));
 
-        return response()->json(['message' => $msg, 'conversation' => $chat->fresh()]);
+        // Broadcast inmediato: entrega el mensaje al cliente en ~80ms.
+        NewChatMessage::dispatchSafe($msg, $chat->session_id, $newStatus);
+
+        // Persistencia diferida (no retrasa la entrega ni la respuesta percibida).
+        $chatId = $chat->id;
+        app()->terminating(function () use ($chatId, $newStatus) {
+            try {
+                ChatConversation::whereKey($chatId)->update([
+                    'status' => $newStatus,
+                    'last_message_at' => now(),
+                ]);
+            } catch (\Throwable $e) {
+                // best-effort
+            }
+        });
+
+        return response()->json(['message' => $msg, 'conversation' => $chat]);
     }
 
     /**
@@ -132,6 +152,7 @@ class ChatController extends Controller
     public function take(Request $request, ChatConversation $chat)
     {
         $chat->update(['status' => 'human']);
+        Cache::forget("chat:conv:{$chat->session_id}");
 
         $msg = ChatMessage::create([
             'conversation_id' => $chat->id,
@@ -140,7 +161,7 @@ class ChatController extends Controller
             'created_at' => now(),
         ]);
 
-        NewChatMessage::dispatchSafe($msg, $chat->session_id);
+        NewChatMessage::dispatchSafe($msg, $chat->session_id, 'human');
 
         return response()->json(['conversation' => $chat->fresh()]);
     }
@@ -151,6 +172,7 @@ class ChatController extends Controller
     public function close(ChatConversation $chat)
     {
         $chat->update(['status' => 'closed', 'closed_at' => now()]);
+        Cache::forget("chat:conv:{$chat->session_id}");
 
         $msg = ChatMessage::create([
             'conversation_id' => $chat->id,
@@ -159,7 +181,7 @@ class ChatController extends Controller
             'created_at' => now(),
         ]);
 
-        NewChatMessage::dispatchSafe($msg, $chat->session_id);
+        NewChatMessage::dispatchSafe($msg, $chat->session_id, 'closed');
 
         return response()->json(['conversation' => $chat->fresh()]);
     }
@@ -218,15 +240,28 @@ class ChatController extends Controller
             'created_at' => now(),
         ]);
 
-        if (in_array($chat->status, ['bot', 'waiting_human'], true)) {
-            $chat->status = 'human';
-        }
-        $chat->last_message_at = now();
-        $chat->save();
+        $newStatus = in_array($chat->status, ['bot', 'waiting_human'], true) ? 'human' : $chat->status;
+        $chat->status = $newStatus;
 
-        NewChatMessage::dispatchSafe($msg, $chat->session_id);
+        // Mantener coherente el caché de conversación del endpoint público.
+        Cache::put("chat:conv:{$chat->session_id}", $chat, now()->addHours(2));
 
-        return response()->json(['message' => $msg, 'conversation' => $chat->fresh()]);
+        // Broadcast inmediato; persistencia del estado diferida.
+        NewChatMessage::dispatchSafe($msg, $chat->session_id, $newStatus);
+
+        $chatId = $chat->id;
+        app()->terminating(function () use ($chatId, $newStatus) {
+            try {
+                ChatConversation::whereKey($chatId)->update([
+                    'status' => $newStatus,
+                    'last_message_at' => now(),
+                ]);
+            } catch (\Throwable $e) {
+                // best-effort
+            }
+        });
+
+        return response()->json(['message' => $msg, 'conversation' => $chat]);
     }
 
     /**
@@ -234,14 +269,31 @@ class ChatController extends Controller
      */
     public static function storeAttachment($file, int $conversationId): array
     {
-        $mime = $file->getMimeType() ?? 'application/octet-stream';
+        $detectedMime = $file->getMimeType() ?? 'application/octet-stream';
+        $clientMime = $file->getClientMimeType() ?: '';
+        $ext = strtolower($file->getClientOriginalExtension() ?: $file->extension() ?: '');
+
+        // Extensiones de audio comunes (las notas de voz webm/ogg suelen detectarse
+        // como video/webm por el contenedor, así que clasificamos también por extensión
+        // y por el mime que reporta el navegador).
+        $audioExts = ['webm', 'ogg', 'oga', 'mp3', 'm4a', 'aac', 'wav', 'weba', 'opus'];
+        $imageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'heic', 'heif'];
+
         $type = match (true) {
-            str_starts_with($mime, 'image/') => 'image',
-            str_starts_with($mime, 'audio/') => 'audio',
+            str_starts_with($detectedMime, 'image/') => 'image',
+            str_starts_with($detectedMime, 'audio/') => 'audio',
+            str_starts_with($clientMime, 'audio/') => 'audio',
+            in_array($ext, $audioExts, true) => 'audio',
+            in_array($ext, $imageExts, true) => 'image',
             default => 'file',
         };
 
-        $ext = $file->getClientOriginalExtension() ?: $file->extension();
+        // Para audios guardamos un mime reproducible por el navegador.
+        $mime = $detectedMime;
+        if ($type === 'audio' && ! str_starts_with($mime, 'audio/')) {
+            $mime = str_starts_with($clientMime, 'audio/') ? $clientMime : 'audio/webm';
+        }
+
         $filename = Str::random(24).($ext ? '.'.$ext : '');
         $dir = "chat/{$conversationId}";
         $path = $file->storeAs($dir, $filename, 'public');

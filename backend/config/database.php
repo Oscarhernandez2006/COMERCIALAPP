@@ -97,6 +97,12 @@ return [
             'prefix_indexes' => true,
             'search_path' => 'public',
             'sslmode' => env('DB_SSLMODE', 'prefer'),
+            // Conexión persistente: reutiliza el socket TCP entre peticiones del mismo
+            // proceso (php artisan serve), evitando reconectar (~850ms) en cada request
+            // contra la BD remota.
+            'options' => [
+                PDO::ATTR_PERSISTENT => (bool) env('DB_PERSISTENT', true),
+            ],
         ],
 
         'sqlsrv' => [

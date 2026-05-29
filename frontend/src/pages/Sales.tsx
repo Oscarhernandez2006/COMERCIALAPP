@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Bot, RefreshCw, Send, Sparkles, User, Wifi, WifiOff, Paperclip, FileText, Download } from 'lucide-react'
+import { Bot, RefreshCw, Send, Sparkles, User, WifiOff, Paperclip, FileText, Download } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import { PageHero } from '@/components/site/SectionHeader'
 import { api } from '@/lib/api'
-import { getEcho } from '@/lib/echo'
+import { getEcho, isEchoConnected } from '@/lib/echo'
 import { toast } from 'sonner'
 import { formatPrice } from '@/hooks/usePublicData'
 import { VoiceRecorder } from '@/components/chat/VoiceRecorder'
@@ -32,6 +31,7 @@ type Message = {
   attachmentMime?: string | null
   attachmentSize?: number | null
   attachmentType?: 'image' | 'file' | 'audio' | 'text' | null
+  uploading?: boolean
 }
 
 type ChatResponse = {
@@ -48,6 +48,16 @@ type ChatResponse = {
 const SESSION_KEY = 'gs_chat_session'
 const MESSAGES_KEY_PREFIX = 'gs_chat_msgs_'
 const CLOSED_AT_KEY_PREFIX = 'gs_chat_closed_at_'
+
+// Fondo doodle estilo WhatsApp Web.
+const WA_DOODLE = `url("data:image/svg+xml;utf8,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60"><g fill="%23a09c94" fill-opacity="0.06"><circle cx="10" cy="10" r="1.6"/><circle cx="30" cy="22" r="1.2"/><circle cx="50" cy="14" r="1.6"/><circle cx="18" cy="42" r="1.2"/><circle cx="42" cy="48" r="1.6"/></g></svg>',
+)}")`
+
+function waInitials(name: string): string {
+  const parts = name.trim().split(/\s+/).slice(0, 2)
+  return parts.map((p) => p.charAt(0).toUpperCase()).join('') || '?'
+}
 
 function purgeChatStorage(sid: string) {
   if (!sid) return
@@ -110,6 +120,28 @@ export default function Sales() {
       return
     }
     if (convStatus === 'closed') return
+
+    // Preview local inmediato (como WhatsApp): el usuario ve/escucha su adjunto al instante.
+    const localUrl = URL.createObjectURL(file)
+    const tempAt = Date.now()
+    const isAudio = file.type.startsWith('audio/') || /\.(webm|ogg|oga|mp3|m4a|aac|wav|opus|weba)$/i.test(file.name)
+    const isImage = file.type.startsWith('image/')
+    const localType: Message['attachmentType'] = isAudio ? 'audio' : isImage ? 'image' : 'file'
+    setMessages((prev) => [
+      ...prev,
+      {
+        who: 'user',
+        text: '',
+        at: tempAt,
+        attachmentUrl: localUrl,
+        attachmentName: file.name,
+        attachmentMime: file.type || (isAudio ? 'audio/webm' : 'application/octet-stream'),
+        attachmentSize: file.size,
+        attachmentType: localType,
+        uploading: true,
+      },
+    ])
+
     setUploading(true)
     try {
       const fd = new FormData()
@@ -121,20 +153,29 @@ export default function Sales() {
       )
       const m = data.message
       const type = m.type as Message['attachmentType']
-      setMessages((prev) => [
-        ...prev,
-        {
-          who: 'user',
-          text: m.body || '',
-          at: new Date(m.created_at).getTime(),
-          attachmentUrl: m.attachment_url,
-          attachmentName: m.attachment_name,
-          attachmentMime: m.attachment_mime,
-          attachmentSize: m.attachment_size,
-          attachmentType: type,
-        },
-      ])
+      // Reemplazamos el mensaje optimista con los datos del servidor (URL persistente).
+      setMessages((prev) =>
+        prev.map((x) =>
+          x.at === tempAt && x.uploading
+            ? {
+                who: 'user',
+                text: m.body || '',
+                at: new Date(m.created_at).getTime(),
+                serverId: m.id,
+                attachmentUrl: m.attachment_url,
+                attachmentName: m.attachment_name,
+                attachmentMime: m.attachment_mime,
+                attachmentSize: m.attachment_size,
+                attachmentType: type,
+              }
+            : x,
+        ),
+      )
+      try { URL.revokeObjectURL(localUrl) } catch { /* noop */ }
     } catch (err) {
+      // Quitamos el preview optimista si falló.
+      setMessages((prev) => prev.filter((x) => !(x.at === tempAt && x.uploading)))
+      try { URL.revokeObjectURL(localUrl) } catch { /* noop */ }
       const e = err as { response?: { data?: { message?: string } }; message?: string }
       toast.error(e?.response?.data?.message ?? e?.message ?? 'No se pudo subir el archivo')
     } finally {
@@ -206,30 +247,48 @@ export default function Sales() {
         attachment_name?: string | null
         attachment_mime?: string | null
         attachment_size?: number | null
+        conversation_status?: string | null
         created_at: string
       }
     }
     const handler = (data: Payload) => {
       const m = data.message
+      // eslint-disable-next-line no-console
+      console.info('[ws] mensaje recibido', { id: m.id, sender: m.sender, body: m.body?.slice(0, 40), at: new Date().toISOString() })
+      // Aplicar el estado de la conversación al instante (sin esperar al polling).
+      if (m.conversation_status) {
+        const next = m.conversation_status
+        const prev = prevStatusRef.current
+        if (prev !== next) {
+          if (next === 'human' && prev !== 'human') playNotify()
+          if (next === 'closed' && prev !== 'closed') playNotify()
+          prevStatusRef.current = next
+        }
+        setConvStatus(next)
+      }
       // El bot llega por la respuesta sincrónica de POST /chat; el cliente origina sus propios mensajes.
       // Realtime solo se usa para seller/system.
       if (m.sender !== 'seller' && m.sender !== 'system') return
       if (m.id <= lastSeenIdRef.current) return
       lastSeenIdRef.current = m.id
-      setMessages((curr) => [
-        ...curr,
-        {
-          who: m.sender as 'seller' | 'system',
-          text: m.body,
-          at: new Date(m.created_at).getTime(),
-          serverId: m.id,
-          attachmentUrl: m.attachment_url ?? null,
-          attachmentName: m.attachment_name ?? null,
-          attachmentMime: m.attachment_mime ?? null,
-          attachmentSize: m.attachment_size ?? null,
-          attachmentType: (m.type as Message['attachmentType']) ?? null,
-        },
-      ])
+      setMessages((curr) => {
+        // Evitar duplicados: si el mensaje ya entró (por polling o WS previo), no lo agregamos.
+        if (curr.some((x) => x.serverId === m.id)) return curr
+        return [
+          ...curr,
+          {
+            who: m.sender as 'seller' | 'system',
+            text: m.body,
+            at: new Date(m.created_at).getTime(),
+            serverId: m.id,
+            attachmentUrl: m.attachment_url ?? null,
+            attachmentName: m.attachment_name ?? null,
+            attachmentMime: m.attachment_mime ?? null,
+            attachmentSize: m.attachment_size ?? null,
+            attachmentType: (m.type as Message['attachmentType']) ?? null,
+          },
+        ]
+      })
       if (m.sender === 'seller') playNotify()
     }
     channel.listen('.message.created', handler)
@@ -298,22 +357,31 @@ export default function Sales() {
 
         if (data.messages.length > 0) {
           const sellerCount = data.messages.filter((m) => m.sender === 'seller').length
-          setMessages((prev) => [
-            ...prev,
-            ...data.messages.map((m) => ({
-              who: m.sender as 'seller' | 'system',
-              text: m.body,
-              at: new Date(m.created_at).getTime(),
-              serverId: m.id,
-              sellerName: data.seller?.name,
-              attachmentUrl: m.attachment_url ?? null,
-              attachmentName: m.attachment_name ?? null,
-              attachmentMime: m.attachment_mime ?? null,
-              attachmentSize: m.attachment_size ?? null,
-              attachmentType: (m.type as Message['attachmentType']) ?? null,
-            })),
-          ])
-          lastSeenIdRef.current = data.messages[data.messages.length - 1].id
+          setMessages((prev) => {
+            // Deduplicar por serverId frente a lo que ya pudo inyectar el WebSocket.
+            const seen = new Set(prev.map((x) => x.serverId).filter((id): id is number => typeof id === 'number'))
+            const incoming = data.messages.filter((m) => !seen.has(m.id))
+            if (incoming.length === 0) return prev
+            return [
+              ...prev,
+              ...incoming.map((m) => ({
+                who: m.sender as 'seller' | 'system',
+                text: m.body,
+                at: new Date(m.created_at).getTime(),
+                serverId: m.id,
+                sellerName: data.seller?.name,
+                attachmentUrl: m.attachment_url ?? null,
+                attachmentName: m.attachment_name ?? null,
+                attachmentMime: m.attachment_mime ?? null,
+                attachmentSize: m.attachment_size ?? null,
+                attachmentType: (m.type as Message['attachmentType']) ?? null,
+              })),
+            ]
+          })
+          lastSeenIdRef.current = Math.max(
+            lastSeenIdRef.current,
+            data.messages[data.messages.length - 1].id,
+          )
           if (sellerCount > 0) playNotify()
         }
       } catch {
@@ -321,7 +389,17 @@ export default function Sales() {
         if (consecutiveErrors >= 2) setIsOffline(true)
       } finally {
         if (!cancelled) {
-          const delay = consecutiveErrors === 0 ? 5000 : Math.min(30000, 2000 * 2 ** consecutiveErrors)
+          // El WebSocket entrega los mensajes al instante. Cuando está conectado el
+          // polling solo reconcilia de vez en cuando (libera el thread del servidor).
+          // Si el WS se cae, volvemos al polling rápido como fallback.
+          let delay: number
+          if (consecutiveErrors > 0) {
+            delay = Math.min(30000, 1500 * 2 ** consecutiveErrors)
+          } else if (isEchoConnected()) {
+            delay = 12000
+          } else {
+            delay = 2000
+          }
           timeout = setTimeout(poll, delay)
         }
       }
@@ -343,7 +421,8 @@ export default function Sales() {
 
   const sendMessage = async (text: string, opts?: { initial?: boolean; restart?: boolean }) => {
     if (!opts?.initial && !text.trim()) return
-    if (sending) return
+    // En modo humano permitimos múltiples envíos en paralelo; en modo bot esperamos respuesta.
+    if (sending && convStatus !== 'human') return
 
     setSending(true)
     if (text.trim()) {
@@ -456,41 +535,36 @@ export default function Sales() {
 
       <section className="container-page py-10 sm:py-14">
         <div className="grid gap-8 lg:grid-cols-[1.4fr_1fr]">
-          {/* CHAT WINDOW */}
-          <div className="overflow-hidden rounded-2xl border border-border bg-white shadow-lg shadow-black/5">
-            <header className="flex items-center justify-between gap-3 border-b border-border bg-gradient-to-r from-brand to-brand-hover px-5 py-4 text-white">
-              <div className="flex items-center gap-3">
+          {/* CHAT WINDOW (estilo WhatsApp Web) */}
+          <div className="overflow-hidden rounded-2xl border border-neutral-200 bg-white shadow-lg shadow-black/5">
+            {/* Header WA */}
+            <header className="flex items-center justify-between gap-3 border-b border-neutral-200 bg-[#f0f2f5] px-4 py-2.5">
+              <div className="flex min-w-0 items-center gap-3">
                 {sellerInfo && convStatus === 'human' && sellerInfo.photo_url ? (
-                  <span className="relative size-10 overflow-hidden rounded-full ring-2 ring-white/30">
+                  <span className="relative size-10 shrink-0 overflow-hidden rounded-full">
                     <img src={sellerInfo.photo_url} alt={sellerInfo.name} className="size-full object-cover" />
-                    <span className="absolute -bottom-0.5 -right-0.5 grid size-3.5 place-items-center rounded-full bg-emerald-400 ring-2 ring-white">
-                      <span className="size-1.5 rounded-full bg-white" />
-                    </span>
                   </span>
                 ) : (
-                  <span className="relative grid size-10 place-items-center rounded-full bg-white/15">
-                    {sellerInfo && convStatus === 'human' ? <User className="h-5 w-5" /> : <Bot className="h-5 w-5" />}
-                    <span className="absolute -bottom-0.5 -right-0.5 grid size-3.5 place-items-center rounded-full bg-emerald-400 ring-2 ring-white">
-                      <span className="size-1.5 rounded-full bg-white" />
-                    </span>
+                  <span
+                    className="grid size-10 shrink-0 place-items-center rounded-full text-sm font-semibold text-white"
+                    style={{ backgroundColor: sellerInfo && convStatus === 'human' ? '#0a7e6d' : '#00a884' }}
+                  >
+                    {sellerInfo && convStatus === 'human' ? waInitials(sellerInfo.name) : 'V'}
                   </span>
                 )}
-                <div className="leading-tight">
-                  <div className="text-sm font-semibold">
+                <div className="min-w-0 leading-tight">
+                  <div className="truncate text-[15px] font-semibold text-neutral-900">
                     {sellerInfo && convStatus === 'human' ? sellerInfo.name : 'Valeria · Atención al cliente'}
                   </div>
-                  <div className="flex items-center gap-1.5 text-[11px] text-white/80">
+                  <div className="flex items-center gap-1.5 text-[12px] text-neutral-500">
                     {isOffline ? (
-                      <>
-                        <WifiOff className="h-3 w-3" /> Reconectando…
-                      </>
+                      <><WifiOff className="h-3 w-3" /> Reconectando…</>
+                    ) : convStatus === 'closed' ? (
+                      'Conversación cerrada'
                     ) : sellerInfo && convStatus === 'human' ? (
-                      <>
-                        <Wifi className="h-3 w-3" />
-                        {`Asesor en línea${sellerInfo.phone ? ` · ${sellerInfo.phone}` : ''}`}
-                      </>
+                      sellerTyping ? 'escribiendo…' : `en línea${sellerInfo.phone ? ` · ${sellerInfo.phone}` : ''}`
                     ) : (
-                      <>En línea · responde en segundos</>
+                      'en línea · responde en segundos'
                     )}
                   </div>
                 </div>
@@ -498,46 +572,58 @@ export default function Sales() {
               <button
                 type="button"
                 onClick={restart}
-                className="inline-flex items-center gap-1.5 rounded-full bg-white/15 px-3 py-1.5 text-xs font-medium text-white/90 transition hover:bg-white/25"
+                className="grid size-9 place-items-center rounded-full text-neutral-600 transition hover:bg-neutral-200"
                 title="Reiniciar conversación"
               >
-                <RefreshCw className="h-3.5 w-3.5" /> Reiniciar
+                <RefreshCw className="h-4 w-4" />
               </button>
             </header>
 
             {convStatus === 'human' && sellerInfo && (
-              <div className="border-b border-emerald-200 bg-emerald-50 px-5 py-2 text-center text-[12px] font-medium text-emerald-800">
-                <span className="font-semibold">{sellerInfo.name}</span> se incorporó a la conversación. Ya hablas con un asesor.
+              <div className="flex justify-center bg-[#fff3cd] px-3 py-1.5">
+                <span className="rounded-full bg-white px-3 py-0.5 text-[11px] text-neutral-700 shadow-sm">
+                  <span className="font-semibold">{sellerInfo.name}</span> se incorporó a la conversación
+                </span>
               </div>
             )}
             {convStatus === 'closed' && (
-              <div className="flex flex-col items-center gap-2 border-b border-neutral-200 bg-neutral-100 px-5 py-3 text-center">
-                <p className="text-[12px] text-neutral-600">
-                  El asesor finalizó la atención. Si necesitas algo más, inicia una conversación nueva.
-                </p>
+              <div className="flex items-center justify-between gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2.5 text-[12px] text-amber-800">
+                <span>El asesor finalizó la atención. Si necesitas algo más, inicia una conversación nueva.</span>
                 <Button
                   size="sm"
-                  className="h-8 bg-[#53AC30] text-white hover:bg-[#3F8A24]"
+                  className="h-8 rounded-full bg-[#00a884] px-3 text-white hover:bg-[#06cf9c]"
                   onClick={restart}
                 >
-                  <RefreshCw className="mr-1 h-3.5 w-3.5" /> Iniciar nuevo chat
+                  <RefreshCw className="mr-1 h-3.5 w-3.5" /> Nuevo chat
                 </Button>
               </div>
             )}
 
+            {/* Área de mensajes con fondo doodle */}
             <div
               ref={scrollRef}
-              className="h-[460px] space-y-4 overflow-y-auto bg-neutral-50 px-4 py-5 sm:px-6"
+              className="h-[460px] space-y-1 overflow-y-auto overscroll-contain px-3 py-4 sm:px-5"
+              style={{ backgroundImage: WA_DOODLE, backgroundColor: '#efeae2' }}
             >
               {!hasMessages && !sending && (
-                <div className="grid h-full place-items-center text-sm text-neutral-400">
-                  Iniciando conversación…
+                <div className="grid h-full place-items-center text-sm text-neutral-500">
+                  <span className="rounded-full bg-white/80 px-4 py-2 shadow-sm">Iniciando conversación…</span>
                 </div>
               )}
 
-              {messages.map((m, i) => (
-                <ChatBubble key={m.serverId ?? `${m.who}-${m.at}-${i}`} msg={m} onSuggestion={(s) => sendMessage(s)} />
-              ))}
+              {messages
+                .filter((m, i) => {
+                  // Deduplicar por serverId: si ya apareció ese id antes, lo omitimos.
+                  if (m.serverId == null) return true
+                  return messages.findIndex((x) => x.serverId === m.serverId) === i
+                })
+                .map((m, i) => (
+                  <ChatBubble
+                    key={m.serverId ?? `${m.who}-${m.at}-${i}`}
+                    msg={m}
+                    onSuggestion={(s) => sendMessage(s)}
+                  />
+                ))}
 
               {sending && <TypingIndicator />}
               {!sending && sellerTyping && convStatus === 'human' && (
@@ -545,9 +631,10 @@ export default function Sales() {
               )}
             </div>
 
+            {/* Input bar WA */}
             <form
               onSubmit={onSubmit}
-              className="flex items-center gap-2 border-t border-border bg-white px-4 py-3 sm:px-5"
+              className="flex items-end gap-2 bg-[#f0f2f5] px-3 py-2.5"
             >
               <input
                 ref={fileInputRef}
@@ -561,30 +648,31 @@ export default function Sales() {
                 disabled={convStatus === 'closed' || uploading}
                 onClick={() => fileInputRef.current?.click()}
                 title="Adjuntar archivo"
-                className="grid h-11 w-9 place-items-center rounded-md text-neutral-500 transition hover:bg-neutral-100 hover:text-neutral-700 disabled:opacity-40"
+                className="grid size-10 shrink-0 place-items-center rounded-full text-neutral-600 transition hover:bg-neutral-200 disabled:opacity-40"
               >
-                <Paperclip className="h-4 w-4" />
+                <Paperclip className="h-5 w-5" />
               </button>
               <VoiceRecorder
                 disabled={convStatus === 'closed' || uploading}
                 onSend={(file) => uploadAttachment(file)}
               />
-              <Input
-                ref={inputRef}
-                placeholder={convStatus === 'closed' ? 'Conversación cerrada' : uploading ? 'Subiendo archivo…' : 'Escribe tu mensaje…'}
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                disabled={sending || uploading || convStatus === 'closed'}
-                className="h-11 flex-1 border-neutral-200 focus-visible:ring-brand"
-                autoComplete="off"
-              />
+              <div className="flex-1 rounded-full bg-white px-4 py-2">
+                <input
+                  ref={inputRef}
+                  placeholder={convStatus === 'closed' ? 'Conversación cerrada' : uploading ? 'Subiendo archivo…' : 'Escribe un mensaje'}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  disabled={(sending && convStatus !== 'human') || uploading || convStatus === 'closed'}
+                  className="w-full bg-transparent text-sm outline-none placeholder:text-neutral-500"
+                  autoComplete="off"
+                />
+              </div>
               <Button
                 type="submit"
-                disabled={sending || !input.trim() || convStatus === 'closed'}
-                className="h-11 bg-brand px-4 text-white hover:bg-brand-hover"
+                disabled={(sending && convStatus !== 'human') || !input.trim() || convStatus === 'closed'}
+                className="grid size-10 shrink-0 place-items-center rounded-full bg-[#00a884] p-0 text-white hover:bg-[#06cf9c]"
               >
-                <Send className="h-4 w-4" />
-                <span className="hidden sm:inline">Enviar</span>
+                <Send className="h-5 w-5" />
               </Button>
             </form>
           </div>
@@ -709,7 +797,7 @@ function ChatBubble({ msg, onSuggestion }: { msg: Message; onSuggestion: (s: str
   if (msg.who === 'system') {
     return (
       <div className="my-1 flex justify-center">
-        <span className="rounded-full bg-neutral-100 px-3 py-1 text-[11px] text-neutral-500">
+        <span className="rounded-full bg-white/85 px-3 py-1 text-[11px] text-neutral-600 shadow-sm">
           {msg.text}
         </span>
       </div>
@@ -720,31 +808,35 @@ function ChatBubble({ msg, onSuggestion }: { msg: Message; onSuggestion: (s: str
   const isSeller = msg.who === 'seller'
   const isBot = msg.who === 'bot'
 
-  const avatarClass = isUser
-    ? 'bg-ink text-white'
-    : isSeller
-      ? 'bg-emerald-500 text-white'
-      : 'bg-brand text-white'
-
+  // Paleta estilo WhatsApp Web
   const bubbleClass = isUser
-    ? 'rounded-tr-sm bg-brand text-white'
+    ? 'bg-[#d9fdd3] text-neutral-900 rounded-tr-sm'
     : isSeller
-      ? 'rounded-tl-sm bg-emerald-50 text-ink ring-1 ring-emerald-200'
-      : 'rounded-tl-sm bg-white text-ink'
+      ? 'bg-white text-neutral-900 rounded-tl-sm'
+      : 'bg-[#eef6ff] text-neutral-900 rounded-tl-sm'
+
+  const time = new Date(msg.at).toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' })
 
   return (
-    <div className={`flex items-start gap-2 ${isUser ? 'flex-row-reverse' : ''}`}>
-      <span className={`grid size-8 shrink-0 place-items-center rounded-full ${avatarClass}`}>
-        {isUser ? <User className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
-      </span>
-
-      <div className={`flex max-w-[85%] flex-col gap-2 ${isUser ? 'items-end' : 'items-start'}`}>
-        {isSeller && msg.sellerName && (
-          <span className="text-[11px] font-semibold text-emerald-700">{msg.sellerName} · Asesor</span>
-        )}
-        <div className={`whitespace-pre-line rounded-2xl px-4 py-2.5 text-sm shadow-sm ${bubbleClass}`}>
+    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
+      <div className={`flex max-w-[78%] flex-col gap-2 ${isUser ? 'items-end' : 'items-start'}`}>
+        <div className={`whitespace-pre-line rounded-2xl px-3 py-1.5 text-[14.5px] shadow-sm ${bubbleClass}`}>
+          {isBot && (
+            <div className="mb-0.5 text-[11px] font-semibold text-[#0a7e6d]">🤖 Valeria · bot</div>
+          )}
+          {isSeller && msg.sellerName && (
+            <div className="mb-0.5 text-[11px] font-semibold text-[#0a7e6d]">{msg.sellerName} · Asesor</div>
+          )}
           <ChatAttachment msg={msg} />
           {msg.text && <div className={msg.attachmentUrl ? 'mt-1.5' : ''}><FormattedText text={msg.text} /></div>}
+          <div className="mt-0.5 flex items-center justify-end gap-1">
+            {msg.uploading && (
+              <span className="flex items-center gap-1 text-[10px] leading-none text-neutral-500">
+                <RefreshCw className="h-2.5 w-2.5 animate-spin" /> subiendo…
+              </span>
+            )}
+            <span className="text-[10px] leading-none text-neutral-500">{time}</span>
+          </div>
         </div>
 
         {isBot && msg.products && msg.products.length > 0 && (
@@ -762,7 +854,7 @@ function ChatBubble({ msg, onSuggestion }: { msg: Message; onSuggestion: (s: str
                 key={s}
                 type="button"
                 onClick={() => onSuggestion(s)}
-                className="rounded-full border border-brand/40 bg-white px-3 py-1.5 text-xs font-medium text-brand-dark transition hover:bg-brand hover:text-white"
+                className="rounded-full border border-[#00a884]/40 bg-white px-3 py-1.5 text-xs font-medium text-[#0a7e6d] transition hover:bg-[#00a884] hover:text-white"
               >
                 {s}
               </button>
