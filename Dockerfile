@@ -49,21 +49,27 @@ RUN composer dump-autoload --optimize --no-dev
 # ---------- Stage 3: runtime (PHP-FPM + Nginx + Reverb) ----------
 FROM php:8.3-fpm-alpine AS runtime
 
-# Paquetes del sistema + extensiones PHP
+# Librerias de runtime (permanecen en la imagen)
 RUN apk add --no-cache \
         nginx \
         supervisor \
-        postgresql-dev \
-        libzip-dev \
-        oniguruma-dev \
         bash \
+        libpq \
+        oniguruma \
+    # Dependencias de compilacion (se eliminan al terminar)
+    && apk add --no-cache --virtual .build-deps \
+        $PHPIZE_DEPS \
+        postgresql-dev \
+        oniguruma-dev \
     && docker-php-ext-install \
         pdo_pgsql \
         pgsql \
         pcntl \
         bcmath \
         sockets \
+        mbstring \
         opcache \
+    && apk del .build-deps \
     && rm -rf /var/cache/apk/*
 
 WORKDIR /var/www/backend
